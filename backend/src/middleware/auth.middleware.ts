@@ -6,6 +6,8 @@ export interface AuthRequest extends Request {
     id: string;
     email?: string;
     role: "PATIENT" | "DOCTOR" | "ADMIN";
+    doctorId?: string;
+    doctorVerificationStatus?: "PENDING" | "APPROVED" | "REJECTED";
   };
 }
 
@@ -50,10 +52,28 @@ export const authenticateUser = async (
       });
     }
 
+    let doctorId: string | undefined;
+    let doctorVerificationStatus: "PENDING" | "APPROVED" | "REJECTED" | undefined;
+
+    if (profile.role === "DOCTOR") {
+      const { data: docData } = await supabaseAdmin
+        .from("doctors")
+        .select("id, verification_status")
+        .eq("profile_id", authData.user.id)
+        .single();
+
+      if (docData) {
+        doctorId = docData.id;
+        doctorVerificationStatus = (docData.verification_status as any) || "PENDING";
+      }
+    }
+
     req.user = {
       id: authData.user.id,
       email: authData.user.email,
-      role: profile.role
+      role: profile.role,
+      doctorId,
+      doctorVerificationStatus
     };
 
     next();

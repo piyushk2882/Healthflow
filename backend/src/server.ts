@@ -6,6 +6,8 @@ import testRoutes from "./routes/test.routes";
 import healthEventRoutes from "./routes/healthEvent.routes";
 import aiTestRoutes from "./routes/aiTest.routes";
 import chatRoutes from "./routes/chat.routes";
+import healthTimelineRoutes from "./routes/healthTimeline.routes";
+import medicationRoutes from "./routes/medication.routes";
 
 dotenv.config();
 
@@ -17,8 +19,10 @@ app.use(express.json());
 app.use("/api/auth", authRoutes);
 app.use("/api/test", testRoutes);
 app.use("/api/health-events", healthEventRoutes);
+app.use("/api/health-timeline", healthTimelineRoutes);
 app.use("/api/ai-test", aiTestRoutes);
 app.use("/api/chat", chatRoutes);
+app.use("/api/medications", medicationRoutes);
 
 
 app.get("/", (req, res) => {

@@ -23,6 +23,15 @@ export const authorizeRoles = (
       });
     }
 
+    // A doctor must be approved to access doctor-restricted operations
+    if (req.user.role === "DOCTOR" && req.user.doctorVerificationStatus !== "APPROVED") {
+      return res.status(403).json({
+        success: false,
+        message: "Doctor account is pending verification and approval. Access denied.",
+        verificationStatus: req.user.doctorVerificationStatus || "PENDING"
+      });
+    }
+
     next();
   };
 };

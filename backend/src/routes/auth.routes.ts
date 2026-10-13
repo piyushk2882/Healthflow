@@ -1,12 +1,14 @@
 import { Router, Response } from "express";
 import {
   signup,
-  login
+  login,
+  approveDoctor
 } from "../controllers/auth.controller";
 import {
   authenticateUser,
   AuthRequest
 } from "../middleware/auth.middleware";
+import { authorizeRoles } from "../middleware/role.middleware";
 
 const router = Router();
 
@@ -33,6 +35,17 @@ router.get(
       user: req.user
     });
   }
+);
+
+/**
+ * PATCH /api/auth/doctors/:doctorId/approve
+ * Admin only approval/rejection endpoint
+ */
+router.patch(
+  "/doctors/:doctorId/approve",
+  authenticateUser,
+  authorizeRoles("ADMIN"),
+  approveDoctor
 );
 
 export default router;
