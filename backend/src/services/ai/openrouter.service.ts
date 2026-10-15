@@ -412,9 +412,9 @@ async function requestAIExtraction(
   }>
 ): Promise<string> {
   try {
-    // 60-second timeout to prevent hanging on slow/overloaded free-tier models
+    // 90-second timeout to prevent hanging on slow/overloaded free-tier models
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 60_000);
+    const timeout = setTimeout(() => controller.abort(), 90_000);
 
     let response;
     try {

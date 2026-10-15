@@ -177,6 +177,34 @@ export interface ChatResponseData {
   };
 }
 
+// Doctor Chat Types
+export interface DoctorChatPatient {
+  patientId: string;
+  fullName: string;
+  assignedAt: string;
+  eventCount: number;
+  medicationCount?: number;
+  lastEvent: {
+    title: string | null;
+    eventDate: string;
+    eventType: string;
+  } | null;
+}
+
+export interface DoctorChatPatientsData {
+  patients: DoctorChatPatient[];
+}
+
+export interface DoctorChatQueryData {
+  patientId: string;
+  patientName: string;
+  query: string;
+  response: string;
+  healthEventsCount: number;
+  medicationsCount?: number;
+  activeMedicationsCount?: number;
+}
+
 let cachedToken: string | null = null;
 let cachedUser: User | null = null;
 
@@ -261,19 +289,37 @@ export async function removeStoredUser(): Promise<void> {
  * Clean user-facing error message extractor
  */
 function sanitizeErrorMessage(error: any, fallback = 'Something went wrong. Please try again.'): string {
-  if (typeof error === 'string') return error;
+  if (typeof error === 'string') {
+    if (
+      error.includes('fetch failed') ||
+      error.includes('Network request failed') ||
+      error.includes('Failed to fetch') ||
+      error.includes('ECONNREFUSED') ||
+      error.includes('ECONNRESET')
+    ) {
+      return `Unable to reach server. Please verify the backend is running at ${API_BASE_URL} and your connection is stable.`;
+    }
+    return error;
+  }
   if (error?.message) {
     if (
       error.message.includes('Network request failed') ||
+      error.message.includes('fetch failed') ||
+      error.message.includes('Failed to fetch') ||
       error.message.includes('ECONNREFUSED') ||
+      error.message.includes('ECONNRESET') ||
       error.message.includes('AbortError') ||
       error.message.includes('timed out')
     ) {
-      return `Unable to reach server at ${API_BASE_URL}. Please verify the backend is running on port 5000.`;
+      return `Unable to reach server. Please verify the backend is running at ${API_BASE_URL} and your connection is stable.`;
     }
     return error.message;
   }
   return fallback;
+}
+
+interface RequestOptions extends RequestInit {
+  timeoutMs?: number;
 }
 
 /**
@@ -281,10 +327,11 @@ function sanitizeErrorMessage(error: any, fallback = 'Something went wrong. Plea
  */
 async function request<T>(
   endpoint: string,
-  options: RequestInit = {}
+  options: RequestOptions = {}
 ): Promise<{ success: boolean; data?: T; message?: string }> {
+  const { timeoutMs = 30000, ...fetchOptions } = options;
   const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), 10000); // 10 second timeout
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const token = await getStoredToken();
@@ -295,7 +342,7 @@ async function request<T>(
 
     const headers: Record<string, string> = {
       'Content-Type': 'application/json',
-      ...(options.headers as Record<string, string>),
+      ...(fetchOptions.headers as Record<string, string>),
     };
 
     if (token) {
@@ -306,11 +353,11 @@ async function request<T>(
     const url = `${baseUrl}${endpoint}`;
 
     if (__DEV__) {
-      console.log(`[API] ${options.method || 'GET'} ${url} [Auth: ${token ? 'Bearer token attached' : 'No token'}]`);
+      console.log(`[API] ${fetchOptions.method || 'GET'} ${url} (timeout: ${timeoutMs}ms) [Auth: ${token ? 'Bearer token attached' : 'No token'}]`);
     }
 
     const response = await fetch(url, {
-      ...options,
+      ...fetchOptions,
       headers,
       signal: controller.signal,
     });
@@ -330,10 +377,20 @@ async function request<T>(
     return json;
   } catch (err: any) {
     clearTimeout(timeoutId);
-    if (err.name === 'AbortError') {
+    const isTimeout =
+      controller.signal.aborted ||
+      err.name === 'AbortError' ||
+      err.name === 'CanceledError' ||
+      (typeof err.message === 'string' &&
+        (err.message.toLowerCase().includes('cancel') ||
+          err.message.toLowerCase().includes('abort') ||
+          err.message.toLowerCase().includes('timed out') ||
+          err.message.toLowerCase().includes('timeout')));
+
+    if (isTimeout) {
       return {
         success: false,
-        message: `Connection timed out. Could not reach ${API_BASE_URL}`,
+        message: 'Request timed out while waiting for AI response. Please try again.',
       };
     }
     return {
@@ -388,6 +445,7 @@ export const api = {
       return request<ChatResponseData>('/api/chat/message', {
         method: 'POST',
         body: JSON.stringify({ message, conversationId }),
+        timeoutMs: 90000,
       });
     },
   },
@@ -495,6 +553,32 @@ export const api = {
       return request<{ log: MedicationLog }>(`/api/medications/${medicationId}/logs`, {
         method: 'POST',
         body: JSON.stringify(data),
+      });
+    },
+  },
+
+  doctorChat: {
+    /**
+     * GET /api/chat/doctor/patients
+     * Fetch all active patients assigned to the logged-in doctor.
+     */
+    getPatients: async () => {
+      return request<DoctorChatPatientsData>('/api/chat/doctor/patients');
+    },
+
+    /**
+     * POST /api/chat/doctor/query
+     * Send a query about a specific patient's health data.
+     */
+    queryPatient: async (
+      patientId: string,
+      message: string,
+      conversationHistory?: Array<{ role: string; content: string }>
+    ) => {
+      return request<DoctorChatQueryData>('/api/chat/doctor/query', {
+        method: 'POST',
+        body: JSON.stringify({ patientId, message, conversationHistory }),
+        timeoutMs: 90000,
       });
     },
   },
