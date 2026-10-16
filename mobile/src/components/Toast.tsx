@@ -11,8 +11,8 @@ interface ToastProps {
 }
 
 export function Toast({ visible, message, type = 'success', onDismiss }: ToastProps) {
-  const opacity = React.useRef(new Animated.Value(0)).current;
-  const translateY = React.useRef(new Animated.Value(-20)).current;
+  const [opacity] = React.useState(() => new Animated.Value(0));
+  const [translateY] = React.useState(() => new Animated.Value(-20));
 
   useEffect(() => {
     if (visible) {

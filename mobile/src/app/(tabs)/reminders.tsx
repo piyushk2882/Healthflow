@@ -10,6 +10,8 @@ import {
   Modal,
   TextInput,
   Alert,
+  AppState,
+  AppStateStatus,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { Ionicons } from '@expo/vector-icons';
@@ -24,6 +26,17 @@ import {
 } from '@/services/api';
 import { useAuth } from '@/context/AuthContext';
 import { formatReadableDate } from '@/utils/dateFormatter';
+import {
+  syncMedicationReminders,
+  getReminderDiagnostics,
+  ReminderDiagnostics,
+} from '@/services/medicationReminders';
+import {
+  getPermissionStatus,
+  requestPermission,
+  openNotificationSettings,
+  PermissionStatus,
+} from '@/services/notifications';
 
 /**
  * Format 24-hr time (e.g. "08:00" or "14:30:00") into 12-hr format (e.g. "8:00 AM")
@@ -74,6 +87,18 @@ export default function RemindersScreen() {
   // Adherence logs cache: key is `${medicationId}-${scheduledTime}`
   const [adherenceLogs, setAdherenceLogs] = useState<Record<string, MedicationLog>>({});
 
+  // Notification permission state
+  const [notificationPermission, setNotificationPermission] = useState<PermissionStatus | null>(null);
+  const [isRequestingPermission, setIsRequestingPermission] = useState(false);
+
+  // Active logging dose key to prevent duplicate clicks: `${medicationId}-${time}`
+  const [loggingDoseKey, setLoggingDoseKey] = useState<string | null>(null);
+
+  // Diagnostics state (__DEV__ only)
+  const [diagnostics, setDiagnostics] = useState<ReminderDiagnostics | null>(null);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [isRefreshingDiagnostics, setIsRefreshingDiagnostics] = useState(false);
+
   // Toast state
   const [toastMessage, setToastMessage] = useState('');
   const [toastType, setToastType] = useState<'success' | 'error' | 'info'>('success');
@@ -103,6 +128,62 @@ export default function RemindersScreen() {
     setToastMessage(msg);
     setToastType(type);
     setShowToast(true);
+  };
+
+  const fetchDiagnostics = useCallback(async () => {
+    if (!__DEV__) return;
+    setIsRefreshingDiagnostics(true);
+    try {
+      const diag = await getReminderDiagnostics();
+      setDiagnostics(diag);
+    } catch {
+      // Ignore
+    } finally {
+      setIsRefreshingDiagnostics(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (__DEV__) {
+      fetchDiagnostics();
+    }
+  }, [fetchDiagnostics]);
+
+  // Check notification permission for patients & listen for app foreground
+  useEffect(() => {
+    if (isAuthenticated && !isDoctor) {
+      getPermissionStatus().then(setNotificationPermission).catch(() => {});
+
+      const sub = AppState.addEventListener('change', (nextState: AppStateStatus) => {
+        if (nextState === 'active') {
+          getPermissionStatus().then(setNotificationPermission).catch(() => {});
+          if (__DEV__) {
+            fetchDiagnostics();
+          }
+        }
+      });
+      return () => {
+        sub.remove();
+      };
+    }
+  }, [isAuthenticated, isDoctor, fetchDiagnostics]);
+
+  const handleRequestNotificationPermission = async () => {
+    setIsRequestingPermission(true);
+    try {
+      const status = await requestPermission();
+      setNotificationPermission(status);
+      if (status === 'granted') {
+        triggerToast('Medication reminders enabled!', 'success');
+        await syncMedicationReminders();
+      } else if (status === 'denied') {
+        openNotificationSettings();
+      }
+    } catch {
+      triggerToast('Unable to update notification permissions.', 'error');
+    } finally {
+      setIsRequestingPermission(false);
+    }
   };
 
   // If user is a DOCTOR, load assigned patients from active relationships
@@ -146,6 +227,7 @@ export default function RemindersScreen() {
           setMedications(meds);
 
           // Fetch logs for each medication to show today's adherence status
+          const todayStr = getTodayIsoDate();
           const logsMap: Record<string, MedicationLog> = {};
           await Promise.all(
             meds.map(async (med) => {
@@ -153,8 +235,21 @@ export default function RemindersScreen() {
                 const logsRes = await api.medications.listLogs(med.id);
                 if (logsRes.success && logsRes.data?.logs) {
                   logsRes.data.logs.forEach((log) => {
-                    const key = `${med.id}-${log.scheduledTime}`;
-                    logsMap[key] = log;
+                    const logDate = new Date(log.scheduledTime);
+                    if (!isNaN(logDate.getTime())) {
+                      const y = logDate.getFullYear();
+                      const m = String(logDate.getMonth() + 1).padStart(2, '0');
+                      const d = String(logDate.getDate()).padStart(2, '0');
+                      const dateStr = `${y}-${m}-${d}`;
+                      const hh = String(logDate.getHours()).padStart(2, '0');
+                      const mm = String(logDate.getMinutes()).padStart(2, '0');
+                      const timeStr = `${hh}:${mm}`;
+
+                      logsMap[`${med.id}-${dateStr}-${timeStr}`] = log;
+                      if (dateStr === todayStr) {
+                        logsMap[`${med.id}-${timeStr}`] = log;
+                      }
+                    }
                   });
                 }
               } catch {
@@ -184,6 +279,7 @@ export default function RemindersScreen() {
    * Flatten daily scheduled doses for patient view matching user screenshot
    */
   const dailyScheduledDoses = useMemo(() => {
+    const todayStr = getTodayIsoDate();
     const list: Array<{
       medication: Medication;
       schedule: MedicationSchedule;
@@ -203,8 +299,8 @@ export default function RemindersScreen() {
           scheduledTime: '08:00',
           dose: med.dosage || '1 dose',
         };
-        const logKey = `${med.id}-08:00`;
-        const log = adherenceLogs[logKey];
+        const logKey = `${med.id}-${todayStr}-08:00`;
+        const log = adherenceLogs[logKey] || adherenceLogs[`${med.id}-08:00`];
         list.push({
           medication: med,
           schedule: fakeSchedule,
@@ -215,8 +311,9 @@ export default function RemindersScreen() {
         });
       } else {
         schedules.forEach((sch) => {
-          const logKey = `${med.id}-${sch.scheduledTime}`;
-          const log = adherenceLogs[logKey];
+          const normTime = sch.scheduledTime.slice(0, 5);
+          const logKey = `${med.id}-${todayStr}-${normTime}`;
+          const log = adherenceLogs[logKey] || adherenceLogs[`${med.id}-${normTime}`];
           list.push({
             medication: med,
             schedule: sch,
@@ -302,6 +399,7 @@ export default function RemindersScreen() {
           triggerToast(`Updated ${formName.trim()} successfully!`);
           setIsEditModalVisible(false);
           loadMedications();
+          syncMedicationReminders().catch(() => {});
         } else {
           triggerToast(res.message || 'Failed to update medication.', 'error');
         }
@@ -322,6 +420,7 @@ export default function RemindersScreen() {
           triggerToast(`Prescribed ${formName.trim()} successfully!`);
           setIsEditModalVisible(false);
           loadMedications();
+          syncMedicationReminders().catch(() => {});
         } else {
           triggerToast(res.message || 'Failed to prescribe medication.', 'error');
         }
@@ -351,6 +450,7 @@ export default function RemindersScreen() {
               if (res.success) {
                 triggerToast(`Deleted ${med.name}`);
                 loadMedications();
+                syncMedicationReminders().catch(() => {});
               } else {
                 triggerToast(res.message || 'Could not delete medication', 'error');
               }
@@ -405,6 +505,7 @@ export default function RemindersScreen() {
         triggerToast(`Added dose time ${formatTime12h(timeClean)}`);
         setActiveSchedules((prev) => [...prev, res.data!.schedule]);
         loadMedications();
+        syncMedicationReminders().catch(() => {});
       } else {
         triggerToast(res.message || 'Failed to add schedule time.', 'error');
       }
@@ -426,6 +527,7 @@ export default function RemindersScreen() {
         triggerToast('Removed dose time');
         setActiveSchedules((prev) => prev.filter((s) => s.id !== scheduleId));
         loadMedications();
+        syncMedicationReminders().catch(() => {});
       } else {
         triggerToast(res.message || 'Failed to remove schedule.', 'error');
       }
@@ -442,23 +544,34 @@ export default function RemindersScreen() {
     scheduledTime: string,
     status: 'TAKEN' | 'SKIPPED'
   ) => {
+    const normTime = scheduledTime.slice(0, 5);
+    const actionKey = `${medication.id}-${normTime}`;
+    if (loggingDoseKey) return; // Prevent duplicate rapid submissions
+
+    setLoggingDoseKey(actionKey);
     try {
-      const parts = scheduledTime.split(':');
+      const parts = normTime.split(':');
       const hour = parseInt(parts[0] || '0', 10);
       const min = parseInt(parts[1] || '0', 10);
-      const doseDate = new Date();
-      doseDate.setHours(hour, min, 0, 0);
+      const now = new Date();
+      const doseDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), hour, min, 0, 0);
       const scheduledIso = doseDate.toISOString();
 
       const res = await api.medications.createLog(medication.id, {
         scheduledTime: scheduledIso,
         status,
         takenAt: status === 'TAKEN' ? new Date().toISOString() : undefined,
+        notes: status === 'SKIPPED' ? 'Skipped by patient' : undefined,
       });
 
       if (res.success && res.data?.log) {
-        const key = `${medication.id}-${scheduledTime}`;
-        setAdherenceLogs((prev) => ({ ...prev, [key]: res.data!.log }));
+        const todayStr = getTodayIsoDate();
+        const key = `${medication.id}-${todayStr}-${normTime}`;
+        setAdherenceLogs((prev) => ({
+          ...prev,
+          [key]: res.data!.log,
+          [`${medication.id}-${normTime}`]: res.data!.log,
+        }));
         triggerToast(
           status === 'TAKEN'
             ? `Marked ${medication.name} as taken!`
@@ -470,6 +583,8 @@ export default function RemindersScreen() {
       }
     } catch (err: any) {
       triggerToast(err.message || 'Error recording dose status.', 'error');
+    } finally {
+      setLoggingDoseKey(null);
     }
   };
 
@@ -732,6 +847,34 @@ export default function RemindersScreen() {
           /* VIEW B: PATIENT VIEW MATCHING SCREENSHOT EXACTLY */
           /* ===================================================== */
           <>
+            {/* Notification Permission Warning Banner */}
+            {notificationPermission && notificationPermission !== 'granted' && (
+              <View style={styles.permissionWarningCard}>
+                <View style={styles.permissionWarningIconWrap}>
+                  <Ionicons name="notifications-off-outline" size={20} color="#b45309" />
+                </View>
+                <View style={styles.permissionWarningTextWrap}>
+                  <Text style={styles.permissionWarningTitle}>Reminders are disabled</Text>
+                  <Text style={styles.permissionWarningBody}>
+                    Turn on notifications to receive timely alerts for your scheduled medicines.
+                  </Text>
+                </View>
+                <TouchableOpacity
+                  style={styles.permissionWarningButton}
+                  onPress={handleRequestNotificationPermission}
+                  disabled={isRequestingPermission}
+                  activeOpacity={0.8}>
+                  {isRequestingPermission ? (
+                    <ActivityIndicator size="small" color="#ffffff" />
+                  ) : (
+                    <Text style={styles.permissionWarningButtonText}>
+                      {notificationPermission === 'denied' ? 'Settings' : 'Enable'}
+                    </Text>
+                  )}
+                </TouchableOpacity>
+              </View>
+            )}
+
             {/* Top Encouragement Pill */}
             <View style={styles.patientTopPillWrap}>
               <View style={styles.patientTopPill}>
@@ -801,6 +944,8 @@ export default function RemindersScreen() {
                 {dailyScheduledDoses.map((item, index) => {
                   const { medication, scheduledTime, isTaken, isSkipped } = item;
                   const displayTime = formatTime12h(scheduledTime);
+                  const normTime = scheduledTime.slice(0, 5);
+                  const isDoseLoading = loggingDoseKey === `${medication.id}-${normTime}`;
 
                   // Status badge label and style
                   let badgeLabel = 'Upcoming';
@@ -848,9 +993,12 @@ export default function RemindersScreen() {
                           style={[
                             styles.patientCheckCircle,
                             isTaken && styles.patientCheckCircleTaken,
+                            isSkipped && styles.patientCheckCircleSkipped,
                           ]}>
                           {isTaken ? (
                             <Ionicons name="checkmark" size={16} color={Colors.onPrimary} />
+                          ) : isSkipped ? (
+                            <Ionicons name="close" size={16} color="#6f7976" />
                           ) : null}
                         </View>
 
@@ -859,6 +1007,7 @@ export default function RemindersScreen() {
                             style={[
                               styles.patientCardMedicineName,
                               isTaken && styles.patientCardMedicineNameTaken,
+                              isSkipped && styles.patientCardMedicineNameSkipped,
                             ]}>
                             {medication.name}
                           </Text>
@@ -867,14 +1016,33 @@ export default function RemindersScreen() {
                           </Text>
                         </View>
 
-                        {/* "Take Now" Button for Pending Doses */}
+                        {/* Action Buttons for Pending Doses: Skip & Take Now */}
                         {!isTaken && !isSkipped && (
-                          <TouchableOpacity
-                            style={styles.takeNowButton}
-                            onPress={() => handleLogAdherence(medication, scheduledTime, 'TAKEN')}
-                            activeOpacity={0.8}>
-                            <Text style={styles.takeNowButtonText}>Take Now</Text>
-                          </TouchableOpacity>
+                          <View style={styles.patientCardActionsGroup}>
+                            <TouchableOpacity
+                              style={styles.skipButton}
+                              onPress={() => handleLogAdherence(medication, scheduledTime, 'SKIPPED')}
+                              disabled={!!loggingDoseKey}
+                              activeOpacity={0.7}>
+                              {isDoseLoading ? (
+                                <ActivityIndicator size="small" color="#6f7976" />
+                              ) : (
+                                <Text style={styles.skipButtonText}>Skip</Text>
+                              )}
+                            </TouchableOpacity>
+
+                            <TouchableOpacity
+                              style={styles.takeNowButton}
+                              onPress={() => handleLogAdherence(medication, scheduledTime, 'TAKEN')}
+                              disabled={!!loggingDoseKey}
+                              activeOpacity={0.8}>
+                              {isDoseLoading ? (
+                                <ActivityIndicator size="small" color="#0a6859" />
+                              ) : (
+                                <Text style={styles.takeNowButtonText}>Take Now</Text>
+                              )}
+                            </TouchableOpacity>
+                          </View>
                         )}
                       </View>
                     </View>
@@ -883,6 +1051,148 @@ export default function RemindersScreen() {
               </View>
             )}
           </>
+        )}
+
+        {/* ===================================================== */}
+        {/* DEV-ONLY DIAGNOSTICS CARD */}
+        {/* ===================================================== */}
+        {__DEV__ && (
+          <View style={styles.devDiagnosticsCard}>
+            <TouchableOpacity
+              style={styles.devDiagnosticsHeader}
+              onPress={() => {
+                const next = !showDiagnostics;
+                setShowDiagnostics(next);
+                if (next) fetchDiagnostics();
+              }}
+              activeOpacity={0.8}>
+              <View style={styles.devDiagnosticsHeaderLeft}>
+                <Ionicons name="construct-outline" size={17} color="#0a6859" />
+                <Text style={styles.devDiagnosticsTitle}>Notification Diagnostics</Text>
+                <View style={styles.devTag}>
+                  <Text style={styles.devTagText}>DEV</Text>
+                </View>
+              </View>
+              <Ionicons
+                name={showDiagnostics ? 'chevron-up' : 'chevron-down'}
+                size={18}
+                color="#6f7976"
+              />
+            </TouchableOpacity>
+
+            {showDiagnostics && (
+              <View style={styles.devDiagnosticsBody}>
+                <View style={styles.devDiagRow}>
+                  <Text style={styles.devDiagLabel}>Permission Status:</Text>
+                  <Text
+                    style={[
+                      styles.devDiagValue,
+                      diagnostics?.permissionStatus === 'granted'
+                        ? styles.devDiagValueSuccess
+                        : styles.devDiagValueWarn,
+                    ]}>
+                    {diagnostics?.permissionStatus || 'checking...'}
+                  </Text>
+                </View>
+
+                <View style={styles.devDiagRow}>
+                  <Text style={styles.devDiagLabel}>Eligible Doses in Window:</Text>
+                  <Text style={styles.devDiagValue}>
+                    {diagnostics?.eligibleDosesInWindow ?? '—'}
+                  </Text>
+                </View>
+
+                <View style={styles.devDiagRow}>
+                  <Text style={styles.devDiagLabel}>Pending Scheduled Reminders:</Text>
+                  <Text style={styles.devDiagValue}>
+                    {diagnostics?.pendingScheduledCount ?? '—'}
+                  </Text>
+                </View>
+
+                <View style={styles.devDiagRow}>
+                  <Text style={styles.devDiagLabel}>Total OS Notifications:</Text>
+                  <Text style={styles.devDiagValue}>
+                    {diagnostics?.totalScheduledCount ?? '—'}
+                  </Text>
+                </View>
+
+                <View style={styles.devDiagRow}>
+                  <Text style={styles.devDiagLabel}>Last Sync Time:</Text>
+                  <Text style={styles.devDiagValue}>
+                    {diagnostics?.lastSyncTime
+                      ? new Date(diagnostics.lastSyncTime).toLocaleTimeString()
+                      : 'Never'}
+                  </Text>
+                </View>
+
+                <View style={styles.devDiagRow}>
+                  <Text style={styles.devDiagLabel}>Latest Reconcile Result:</Text>
+                  <Text style={styles.devDiagValue}>
+                    {diagnostics?.lastSyncStats
+                      ? `+${diagnostics.lastSyncStats.scheduled} sched, =${diagnostics.lastSyncStats.kept} kept, -${diagnostics.lastSyncStats.cancelled} canc`
+                      : 'None'}
+                  </Text>
+                </View>
+
+                {!!diagnostics?.truncatedDosesCount && (
+                  <View style={styles.devDiagRow}>
+                    <Text style={styles.devDiagLabel}>Truncated Doses (Limit 60):</Text>
+                    <Text style={[styles.devDiagValue, styles.devDiagValueWarn]}>
+                      {diagnostics.truncatedDosesCount}
+                    </Text>
+                  </View>
+                )}
+
+                {!!diagnostics?.lastSyncError && (
+                  <View style={styles.devDiagErrorBox}>
+                    <Ionicons name="warning-outline" size={14} color="#b45309" />
+                    <Text style={styles.devDiagErrorText}>{diagnostics.lastSyncError}</Text>
+                  </View>
+                )}
+
+                <View style={styles.devDiagActionsRow}>
+                  <TouchableOpacity
+                    style={styles.devDiagBtn}
+                    onPress={fetchDiagnostics}
+                    disabled={isRefreshingDiagnostics}
+                    activeOpacity={0.8}>
+                    {isRefreshingDiagnostics ? (
+                      <ActivityIndicator size="small" color="#0a6859" />
+                    ) : (
+                      <>
+                        <Ionicons name="refresh" size={13} color="#0a6859" />
+                        <Text style={styles.devDiagBtnText}>Refresh Status</Text>
+                      </>
+                    )}
+                  </TouchableOpacity>
+
+                  <TouchableOpacity
+                    style={[styles.devDiagBtn, styles.devDiagBtnPrimary]}
+                    onPress={async () => {
+                      setIsRefreshingDiagnostics(true);
+                      try {
+                        const res = await syncMedicationReminders();
+                        triggerToast(
+                          `Sync: ${res.scheduled} sched, ${res.kept} kept, ${res.cancelled} canc`
+                        );
+                        await fetchDiagnostics();
+                      } catch (err: any) {
+                        triggerToast(err?.message || 'Sync failed', 'error');
+                      } finally {
+                        setIsRefreshingDiagnostics(false);
+                      }
+                    }}
+                    disabled={isRefreshingDiagnostics}
+                    activeOpacity={0.8}>
+                    <Ionicons name="sync-outline" size={13} color="#ffffff" />
+                    <Text style={[styles.devDiagBtnText, { color: '#ffffff' }]}>
+                      Sync Reminders Now
+                    </Text>
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+          </View>
         )}
       </ScrollView>
 
@@ -1548,6 +1858,54 @@ const styles = StyleSheet.create({
     opacity: 0.5,
   },
 
+  /* PERMISSION WARNING BANNER */
+  permissionWarningCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#fffbeb',
+    borderWidth: 1,
+    borderColor: '#fde68a',
+    borderRadius: 16,
+    padding: Spacing.three,
+    marginBottom: Spacing.four,
+    gap: Spacing.three,
+  },
+  permissionWarningIconWrap: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: '#fef3c7',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  permissionWarningTextWrap: {
+    flex: 1,
+  },
+  permissionWarningTitle: {
+    ...Typography.caption,
+    fontWeight: '700',
+    color: '#92400e',
+    fontSize: 13,
+  },
+  permissionWarningBody: {
+    ...Typography.caption,
+    color: '#b45309',
+    fontSize: 11,
+    marginTop: 2,
+  },
+  permissionWarningButton: {
+    backgroundColor: '#d97706',
+    paddingHorizontal: Spacing.three,
+    paddingVertical: 7,
+    borderRadius: 9999,
+  },
+  permissionWarningButtonText: {
+    ...Typography.caption,
+    color: '#ffffff',
+    fontWeight: '700',
+    fontSize: 11,
+  },
+
   /* PATIENT DOSE CARDS (MATCHING SCREENSHOT) */
   patientCardsList: {
     gap: Spacing.three,
@@ -1625,6 +1983,9 @@ const styles = StyleSheet.create({
   patientCheckCircleTaken: {
     backgroundColor: '#0a6859',
   },
+  patientCheckCircleSkipped: {
+    backgroundColor: '#eae8e4',
+  },
   patientCardInfo: {
     flex: 1,
     gap: 3,
@@ -1639,9 +2000,31 @@ const styles = StyleSheet.create({
     textDecorationLine: 'line-through',
     opacity: 0.8,
   },
+  patientCardMedicineNameSkipped: {
+    opacity: 0.6,
+  },
   patientCardDosageText: {
     ...Typography.caption,
     color: '#3f4946',
+    fontSize: 12,
+  },
+  patientCardActionsGroup: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  skipButton: {
+    paddingHorizontal: Spacing.three,
+    paddingVertical: 7,
+    borderRadius: 9999,
+    backgroundColor: '#eae8e4',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  skipButtonText: {
+    ...Typography.caption,
+    color: '#6f7976',
+    fontWeight: '600',
     fontSize: 12,
   },
   takeNowButton: {
@@ -1922,5 +2305,113 @@ const styles = StyleSheet.create({
     ...Typography.caption,
     color: '#ffffff',
     fontWeight: '700',
+  },
+
+  /* DEV-ONLY DIAGNOSTICS STYLES */
+  devDiagnosticsCard: {
+    backgroundColor: '#ffffff',
+    borderRadius: 14,
+    borderWidth: 1.5,
+    borderColor: '#e2dfd7',
+    marginTop: Spacing.four,
+    overflow: 'hidden',
+    ...Shadows.soft,
+  },
+  devDiagnosticsHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: Spacing.three,
+    paddingHorizontal: Spacing.three,
+    backgroundColor: '#f5f3ef',
+  },
+  devDiagnosticsHeaderLeft: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  devDiagnosticsTitle: {
+    ...Typography.labelMedium,
+    color: '#0a6859',
+    fontWeight: '700',
+    fontSize: 13,
+  },
+  devTag: {
+    backgroundColor: '#0a6859',
+    borderRadius: 6,
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+  },
+  devTagText: {
+    color: '#ffffff',
+    fontSize: 9,
+    fontWeight: '800',
+    letterSpacing: 0.5,
+  },
+  devDiagnosticsBody: {
+    padding: Spacing.three,
+    gap: 8,
+  },
+  devDiagRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingVertical: 2,
+  },
+  devDiagLabel: {
+    ...Typography.caption,
+    color: '#6f7976',
+    fontSize: 12,
+  },
+  devDiagValue: {
+    ...Typography.caption,
+    color: '#1b1c1a',
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  devDiagValueSuccess: {
+    color: '#1b7a67',
+  },
+  devDiagValueWarn: {
+    color: '#b45309',
+  },
+  devDiagErrorBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    backgroundColor: '#fef3c7',
+    padding: 8,
+    borderRadius: 8,
+    marginTop: 4,
+  },
+  devDiagErrorText: {
+    ...Typography.caption,
+    color: '#92400e',
+    fontSize: 11,
+    flex: 1,
+  },
+  devDiagActionsRow: {
+    flexDirection: 'row',
+    gap: 8,
+    marginTop: 8,
+  },
+  devDiagBtn: {
+    flex: 1,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 6,
+    backgroundColor: '#e8f2f0',
+    borderRadius: 8,
+    paddingVertical: 8,
+  },
+  devDiagBtnPrimary: {
+    backgroundColor: '#0a6859',
+  },
+  devDiagBtnText: {
+    ...Typography.caption,
+    color: '#0a6859',
+    fontWeight: '700',
+    fontSize: 11,
   },
 });
